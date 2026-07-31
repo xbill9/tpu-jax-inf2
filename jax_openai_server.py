@@ -301,7 +301,11 @@ def list_models():
 def _chat_prompt_ids(messages) -> list[int]:
     formatted = [{"role": m.role, "content": m.content} for m in messages]
     if hasattr(TOKENIZER, "apply_chat_template"):
-        return TOKENIZER.apply_chat_template(formatted, tokenize=True, add_generation_prompt=True)
+        res = TOKENIZER.apply_chat_template(formatted, tokenize=True, add_generation_prompt=True)
+        try:
+            return res["input_ids"]
+        except (KeyError, TypeError):
+            return res
     text = "\n".join(f"{m.role}: {m.content}" for m in messages)
     return TOKENIZER(text)["input_ids"]
 
@@ -356,6 +360,8 @@ def chat_completions(req: ChatCompletionRequest):
     except HTTPException:
         raise
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         METRICS["failed_requests"] += 1
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -402,6 +408,8 @@ def text_completions(req: CompletionRequest):
     except HTTPException:
         raise
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         METRICS["failed_requests"] += 1
         raise HTTPException(status_code=500, detail=str(exc))
 
