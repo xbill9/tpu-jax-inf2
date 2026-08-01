@@ -25,6 +25,14 @@ from the proven `torch_neuronx` Option-B serving path under `quant/`.
    QAT checkpoint is not evidence that compressed weights remain compressed in
    the compiled graph.
 
+## Platform quirks
+
+`../docs/neuron-jax-quirks.md` collects what this stack does differently from
+TPU, measured on device. Read it before debugging anything here — the headline
+is that a gather over the 4.70 GB PLE table returns **zeros rather than an
+error**, which surfaces as a clean `200 OK` with zero completion tokens, and
+that the workaround for it currently costs a factor of 2700.
+
 ## Three tools, three different questions
 
 `probe.py` asks whether the runtime works, `compile_probe.py` whether the
