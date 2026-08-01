@@ -29,6 +29,30 @@ def configure_neuron() -> None:
     # vocabulary for inf2 under neuronx-cc 2.26. Kept as a setdefault so a caller
     # comparing sampled output against the TPU path can pin threefry instead.
     os.environ.setdefault("JAX_DEFAULT_PRNG_IMPL", "rbg")
+    # This one variable costs ~2700x, and it is load-bearing for CORRECTNESS.
+    # Do not remove it without first fixing what it is hiding.
+    #
+    # MEASURED on inf2.xlarge, same engine, weights, device and checkpoint,
+    # varying only this variable (2026-07-31, see
+    # benchmarks/runs/2026-07-31-inf2-serving-perf/):
+    #
+    #   =1     : "The capital of France is" -> 'Paris.', 5 tokens, ~126 s
+    #   unset  : same prompt -> '' , 0 completion tokens, ~0.01 s
+    #
+    # Unset, generation emits EOS on the first sampled token every time. So some
+    # operation in the decode graph computes the wrong thing on the NeuronCore
+    # and is only right when dispatched to the host. Setting this is a
+    # workaround, not a configuration preference.
+    #
+    # The cost of the workaround: every decode step ships parameter-sized
+    # buffers through host memory -- 13.71 GB of host churn per request against
+    # 0.00 GB without it, 6.89 s/token against 0.002 s/token. On a 16 GB host
+    # that exhausts RAM and the box swaps (116 MB/s out, 55% iowait). Device HBM
+    # never moves throughout, so the accelerator looks idle and healthy while
+    # this happens.
+    #
+    # The real fix is to find the miscomputing op -- jax_neuron/parity.py is the
+    # tool, and it must be run with this variable unset to reproduce the fault.
     os.environ.setdefault("NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU", "1")
     os.environ.setdefault("NEURON_CC_FLAGS", "--model-type=transformer")
     # No JAX_E_PALLAS_INTERPRET override here any more. The engine reads

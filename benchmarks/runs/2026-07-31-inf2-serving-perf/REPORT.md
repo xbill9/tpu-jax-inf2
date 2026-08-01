@@ -7,25 +7,51 @@
 **Checkpoint:** `google/gemma-4-E2B-it-qat-w4a16-ct` (compressed W4A16, `--quant-mode w4a16`, int8 KV)
 **Server:** `deployments/aws-inf2/neuron_entrypoint.py`, `--max-model-len 4096`, bound `127.0.0.1:8000`
 
-## Result: the weights are stored compressed and computed dense
+## Result: one environment variable costs 2700x, and it is load-bearing
 
 Milestone 4's HTTP contract works and is correct — five identical greedy requests
 all returned `'Paris.'` for `"The capital of France is"`, `finish_reason: stop`,
 6 prompt / 5 completion tokens. It is also **~0.08 tok/s**, about 11–13 s per
 decode step.
 
-Two separate things are wrong, and only one of them is solved.
+The cause is a single line, `deployments/aws-inf2/neuron_entrypoint.py:32`:
 
-**Solved:** on Neuron the W4A16 matmul is forced onto the dequantize-then-matmul
-reference path, which materializes dense BF16 weights. Measured at **27x per
-call** against a dense matmul over the same stack. The weights are stored
-compressed and read dense.
+```python
+os.environ.setdefault("NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU", "1")
+```
 
-**Unsolved:** per decode step the process allocates and frees several GB on a
-host with 16 GB of RAM, and the box swaps. Every structural hypothesis for this
-has been refuted by measurement — argument staging, the W4A16 dequantization
-itself, device-memory headroom, and buffer count. It is not the compiler, not
-the checkpoint, and not the NeuronCore, and it is not yet explained.
+Same engine, same weights, same device, same checkpoint, varying only this:
+
+| | `=1` | unset |
+|---|---|---|
+| `generate_stream` warm, 20 tokens | **163.34 s** | **0.06 s** |
+| steady per-token | 6.89 s | 0.002 s |
+| host RSS delta per request | 13.71 GB | 0.00 GB |
+| prefill_ms / decode_ms | 21,127.8 / 142,010.5 | 0.9 / 41.8 |
+
+**But it cannot simply be removed.** End-to-end through the HTTP server:
+
+| | output | latency |
+|---|---|---|
+| `=1` | `'Paris.'`, 5 completion tokens | ~126 s |
+| unset | `''`, **0 completion tokens** | ~0.01 s |
+
+Unset, generation emits EOS on the first sampled token, every time. So some
+operation in the decode graph **computes the wrong thing on the NeuronCore** and
+is only correct when dispatched to the host. The variable is a correctness
+workaround, and the 2700x is what the workaround costs: every decode step ships
+parameter-sized buffers through host memory, exhausting a 16 GB host and sending
+it into swap.
+
+This is the failure mode `CLAUDE.md` warns about, twice over. The slow path runs,
+reports success, and is correct. The fast path runs, reports success, and is
+wrong — and would have been recorded as a 2700x win if the token *content* had
+not been checked. An earlier isolation run in this same session counted 20
+tokens returned and never inspected them.
+
+Two further costs were quantified along the way and remain real but secondary:
+the W4A16 reference path (dequantize-then-matmul, forced on Neuron) at **27x per
+call** against dense, and a **52x per-call cliff** above ~128 parameter buffers.
 
 | | Device HBM | Host RSS |
 |---|---|---|
@@ -157,6 +183,31 @@ cliff. At ~0.8 ms per buffer it accounts for a few hundred ms per decode step �
 material, but a small fraction of the observed 11-13 s, so it is a contributing
 factor and not the explanation.
 
+### How it was found: the engine is fast, the process is slow
+
+Seven synthetic isolation tests reproduced nothing. What finally separated the
+variables was driving the real `JaxGemmaEngine` directly, outside the server
+process, with `JAX_COMPILATION_CACHE_DIR` pointed at the same cache:
+
+| call | delta GB | time |
+|---|---|---|
+| `_jit_prefill` warm | 0.00 | 0.02 s |
+| `_decode_step` warm | 0.00 | 0.02 s |
+| `generate_stream` warm, 20 tokens | 0.00 | **0.06 s** |
+| `generate` warm, 20 tokens | 0.00 | **0.06 s** |
+
+The engine, including its Python streaming loop, produces 20 tokens in 0.06 s
+with no host churn — while the server takes 60–126 s for the same work. That
+localised the cost to the *process*, not the engine, the model, or the device.
+Calling the engine from a worker thread, a fresh thread per call, and a
+`ThreadPoolExecutor` were all 0.042–0.045 s, ruling out the FastAPI threadpool.
+
+The remaining difference was `neuron_entrypoint.py`, which sets three variables
+the standalone runs never had. Re-running the identical benchmark under them
+reproduced the fault exactly (163.34 s, 13.71 GB), and dropping only
+`NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU` while keeping `JAX_PLATFORMS=neuron,cpu`
+and `JAX_DEFAULT_PRNG_IMPL=rbg` restored 0.06 s and 0.00 GB. One variable.
+
 ### What was tested and refuted
 
 The first hypothesis was that the Neuron plugin fails to hold a large jit
@@ -261,13 +312,16 @@ ahead-of-time static-shape compiler. The names mislead; the reuse is sound.
    512-buffer cliff above is real and the engine sits past it. Consolidating
    per-layer tensors into stacked arrays would move it back under 128. Worth a
    few hundred ms per step, not seconds.
-2. **Find the host churn.** Every structural hypothesis is now refuted by
-   measurement — argument staging, W4A16 dequantization, device-memory headroom,
-   and buffer count. The isolation harness does not reproduce it, so the next
-   step is to stop trying to reproduce it synthetically and instrument the real
-   engine: run `JaxGemmaEngine` standalone with the service stopped, under
-   `tracemalloc` plus `jax.profiler`, and attribute the allocation directly.
-   That needs the service down anyway, so pair it with any other on-device work.
+2. **Find the op that miscomputes on Neuron.** This is now the whole game: it is
+   worth 2700x and it is the only thing standing between this port and a fast,
+   correct server. `jax_neuron/parity.py` is the tool and it already exists —
+   run it with `--subject-platform neuron` and
+   `NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU` **unset**, which is the configuration
+   that produces the fault. Milestone 3's parity run passed, so either it ran
+   with a different configuration or the fault is in an op the parity prompts do
+   not exercise; establishing which is the first question.
+   Bisect from there: the symptom is EOS on the first sampled token, which
+   points at the logits path or the sampler rather than the attention stack.
 3. **Find a compressed-compute path for Neuron.** The port has no way to keep
    W4A16 weights compressed through the matmul: the fused kernel is
    Pallas/Mosaic and neuronx-cc cannot accept it, and the only alternative
