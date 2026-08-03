@@ -15,6 +15,12 @@ pieces are isolated here:
 - `deploy.py` plans, launches, or terminates one tagged EC2 host with SSM access
   and a persistent EBS cache volume.
 
+> **Start here to bring a host up: [RESUME.md](RESUME.md).** It carries the
+> current launch command, the verification order, and the traps. Sections below
+> that predate 2026-08-03 describe older pins — RESUME.md and
+> [BISECT.md](../../benchmarks/runs/2026-08-02-inf2-latest-stack-e2b/BISECT.md)
+> win where they disagree.
+
 ## Support boundary
 
 AWS documents JAX NeuronX on Inf2 as beta. This scaffold is therefore a porting
@@ -23,6 +29,13 @@ target, not a measured-performance claim. In particular:
 - W4A16 uses the JAX reference dequantize-and-matmul path, which is the engine
   default. The optional fused kernel lowers through Mosaic and cannot compile on
   Neuron at all, so `set_w4a16_impl` refuses it outright on this platform.
+  **That reference path miscomputes on the NeuronCore when it runs in-graph**
+  (greedy decode emits one token repeated, 0.0 agreement against a CPU oracle).
+  The service therefore runs `--dequant-at-load`, which performs the identical
+  arithmetic on the host and is correct at ~43 tok/s settled. Removing that flag
+  brings the garbage back. Localized 2026-08-03; `neuronx-cc`'s handling of the
+  fused dequant-and-matmul at real shapes is still open upstream. See
+  [BISECT.md](../../benchmarks/runs/2026-08-02-inf2-latest-stack-e2b/BISECT.md).
 - The complete Gemma decode, prefill, and sampling graphs compile to NEFFs for
   `inf2` (see the compatibility section below) **and produce correct tokens**:
   greedy output is identical to a PyTorch float32 CPU reference on the real
@@ -36,7 +49,16 @@ target, not a measured-performance claim. In particular:
 - `jax.debug` callbacks/checkify, dynamic `while_loop`, integer dot products,
   and several other JAX features are unsupported on Neuron. The serving path
   must remain static-shaped.
-- The bootstrap pins the JAX NeuronX component to `0.6.2.1.0.*`, which is an
+- **SUPERSEDED 2026-08-02 — the two paragraphs below describe the old pinning and
+  are kept only for the reasoning.** The bootstrap now takes
+  `jax-neuronx[stable]==0.10.0.1.0.*` on `ami-09e1477ba5140fe3e` (Ubuntu 24.04,
+  **SDK 2.31.0**, NRT 2.33.10.0) with jax/jaxlib 0.9.2, and `libneuronxla` is
+  **not** pinned — the metapackage resolves 3.0.3854.0, the exact build the old
+  pin existed to avoid, and it works because this AMI ships an NRT it matches.
+  The rule that survives: move the jax-neuronx pin and the AMI together, and
+  re-run `jax_neuron/probe.py` (a one-minute check) when you do.
+
+  The bootstrap pins the JAX NeuronX component to `0.6.2.1.0.*`, which is an
   SDK-2.28 build. This pin is about the JAX PJRT plugin only — Inf2 itself is not
   deprecated on newer lines; a sibling deployment in this org runs an SDK-**2.30**
   vLLM container on the same `inf2.xlarge`. If you move the pin, move the AMI with
