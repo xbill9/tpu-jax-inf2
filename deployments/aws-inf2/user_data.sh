@@ -16,10 +16,12 @@ NEURON_CC_FLAGS_VALUE=__NEURON_CC_FLAGS__
 # 9.6 GB re-download and a full NEFF recompile.
 CACHE_WAIT_SECS=180
 
-# neuronx-cc is a console script in the venv and libneuronxla shells out to it
-# by bare name. Defined once here and reused for both the fail-fast probe and
-# the systemd unit so the two cannot drift.
-SERVICE_PATH=/opt/gemma4/venv/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# neuronx-cc is a console script and libneuronxla shells out to it by bare name.
+# Defined once here and reused for both the fail-fast probe and the systemd unit
+# so the two cannot drift. No venv, per this repo's standard (CLAUDE.md Coding
+# Standards): packages install into the DLAMI's own interpreter, so the console
+# scripts land in /usr/local/bin, which is already on this PATH.
+SERVICE_PATH=/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 exec > >(tee /var/log/gemma4-jax-inf2-bootstrap.log | logger -t gemma4-inf2 -s 2>/dev/console) 2>&1
 
@@ -38,7 +40,9 @@ if ! phase_done os-packages; then
   apt-get update
   # The Neuron DLAMI already ships AWS CLI v2 and the Python the Neuron wheels
   # are built against; do not install a second interpreter or a v1 CLI over them.
-  apt-get install -y python3-venv
+  # python3-pip, not python3-venv: this deployment installs into that shipped
+  # interpreter directly rather than building a venv on top of it.
+  apt-get install -y python3-pip
   phase_mark os-packages
 fi
 command -v aws >/dev/null || { echo "FATAL: AWS CLI missing from the AMI" >&2; exit 1; }
@@ -57,10 +61,11 @@ if [ "$SWAP_GIB" -gt 0 ] && ! swapon --show=NAME --noheadings | grep -q '^/swapf
 fi
 
 CACHE_ROOT=/opt/gemma4/cache
-# Owned by ubuntu, not root: the venv below is created as ubuntu *inside* this
-# directory, and a root-owned parent fails it with EACCES. Under `set -e` that
-# aborts the bootstrap before pip and systemd ever run, leaving a host that
-# looks booted and serves nothing.
+# Owned by ubuntu, not root: the app tree and caches below are written as ubuntu
+# *inside* this directory, and a root-owned parent fails them with EACCES. Under
+# `set -e` that aborts the bootstrap before pip and systemd ever run, leaving a
+# host that looks booted and serves nothing. (This mattered doubly when a venv
+# was created here; the ownership requirement outlives it.)
 install -d -o ubuntu -g ubuntu /opt/gemma4
 
 # Find the separate EBS cache volume: on Nitro the attachment point is remapped
@@ -127,41 +132,64 @@ aws s3 cp "$SOURCE_URI" /tmp/gemma4-source.tar.gz --region "$AWS_DEPLOY_REGION"
 tar -xzf /tmp/gemma4-source.tar.gz -C /opt/gemma4/app --strip-components=1
 chown -R ubuntu:ubuntu /opt/gemma4/app
 
-[ -x /opt/gemma4/venv/bin/python ] ||
-  sudo -u ubuntu python3 -m venv /opt/gemma4/venv
-sudo -u ubuntu /opt/gemma4/venv/bin/python -m pip install --upgrade pip
-# Use an SDK-2.28 DLAMI for Inf2. The stable metapackage then selects the tested
+# No venv, per this repo's standard: install into the interpreter the Neuron
+# wheels were built against. Ubuntu 24.04 marks it externally-managed (PEP 668),
+# so every pip call here needs --break-system-packages; without it pip refuses
+# with "error: externally-managed-environment" and the bootstrap dies under
+# `set -e`. Installing system-wide as root (not --user) puts the neuronx-cc
+# console script in /usr/local/bin, which SERVICE_PATH above already carries.
+# --break-system-packages lets pip WRITE to the distro interpreter's
+# site-packages. It does NOT let pip REPLACE a package that apt installed:
+# Debian wheels ship no RECORD file, so any dependency resolution that wants to
+# upgrade one dies with
+#   ERROR: Cannot uninstall typing_extensions 4.10.0, RECORD file not found.
+# and, under `set -e`, takes the whole bootstrap with it — leaving a host with
+# os-packages marked, no python-deps, and cloud-init in `error`. --ignore-installed
+# is the fix: install over the distro copy rather than trying to remove it.
+#
+# Also do NOT add `--upgrade pip`. That is reflexive inside a venv and hits the
+# identical wall here (`Cannot uninstall pip 24.0`); the shipped pip is new
+# enough for everything below.
+#
+# MEASURED 2026-08-02 on i-0d00da0fd6274952d, the first launch after the venv was
+# removed — both failures above are from that host, in that order.
+PIP="python3 -m pip install --break-system-packages --ignore-installed"
+# Pair this with the newest Neuron DLAMI for the OS line (currently
+# ami-09e1477ba5140fe3e, Ubuntu 24.04, Neuron SDK 2.31.0, aws-neuronx-runtime-lib
+# 2.33.10.0). The stable metapackage then selects the tested
 # JAX/jaxlib/libneuronxla combination from that Neuron package repository.
 # --extra-index-url, NOT --index-url. The Neuron repository carries the Neuron
 # wheels only; `jax` itself lives on PyPI. `--index-url` *replaces* the default
-# index, so the jax-neuronx dependency `jax<=0.6.2,>=0.4.30` resolves against a
-# repository that has never held a jax wheel and the install dies with
-# "No matching distribution found for jax" after downloading ~100 MB of
-# libneuronxla. `--extra-index-url` is also the form AWS documents.
+# index, so the jax-neuronx jax dependency resolves against a repository that has
+# never held a jax wheel and the install dies with "No matching distribution
+# found for jax" after downloading ~100 MB of libneuronxla. `--extra-index-url`
+# is also the form AWS documents.
 #
-# libneuronxla is pinned SEPARATELY and deliberately. jax-neuronx 0.6.2.1.0
-# requires only `libneuronxla>=2.2.12677.0` — an unbounded lower bound — so pip
-# resolves the newest, currently 3.0.3854.0. That build targets an NRT 3.0
-# runtime, and this AMI line ships NRT 2.31. The install succeeds, and the
-# failure surfaces much later as a symbol lookup error at PJRT load:
+# libneuronxla is deliberately NOT pinned here, which reverses an earlier
+# decision — read this before re-adding a pin. Under jax-neuronx 0.6.2.1.0 the
+# dependency was `libneuronxla>=2.2.12677.0`, an unbounded lower bound, so pip
+# took the newest (3.0.3854.0). That build targets an NRT 3.0 runtime while the
+# SDK-2.29.1 AMI line shipped NRT 2.31, the install still succeeded, and the
+# failure surfaced much later at PJRT load:
 #
 #   libneuronpjrt.so: undefined symbol: nrta_event_register_xu_completion,
 #   version NRT_3.0.0
 #
-# MEASURED on ami-05235a8b272ee7f7e (Neuron SDK 2.29.1, aws-neuronx-runtime-lib
-# 2.31.24.0): with libneuronxla pinned to the 2.2 line, jax_neuron/probe.py
-# discovers both NeuronCores and executes the decoder block. Move this pin only
-# together with the AMI, and re-run the probe when you do.
+# `libneuronxla==2.2.*` was the fix FOR THAT PAIRING and is wrong for this one.
+# Pinning the current jax-neuronx line lets the metapackage resolve the
+# libneuronxla built against the runtime this AMI actually ships, which is what
+# the pin was approximating by hand. The tripwire is unchanged: the symbol error
+# above means the libneuronxla/NRT pairing is wrong. Move the jax-neuronx pin and
+# the AMI together, and re-run jax_neuron/probe.py when you do — the FAIL FAST
+# gate below catches it in about a minute.
 if ! phase_done python-deps; then
-  sudo -u ubuntu /opt/gemma4/venv/bin/python -m pip install \
-    'jax-neuronx[stable]==0.6.2.1.0.*' 'libneuronxla==2.2.*' \
+  $PIP 'jax-neuronx[stable]==0.10.0.1.0.*' \
     --extra-index-url https://pip.repos.neuron.amazonaws.com
   # deployments/aws-inf2/requirements-serving.txt, NOT the repo-root
   # requirements.txt — that one lists the MCP server's dependencies and none of
   # the serving stack, so a host built from it installs cleanly and then dies on
   # `import fastapi`.
-  sudo -u ubuntu /opt/gemma4/venv/bin/python -m pip install \
-    -r /opt/gemma4/app/deployments/aws-inf2/requirements-serving.txt
+  $PIP -r /opt/gemma4/app/deployments/aws-inf2/requirements-serving.txt
   phase_mark python-deps
 fi
 
@@ -177,7 +205,7 @@ fi
 # say so, and says it as an XLA error rather than as a setup problem.
 if ! phase_done neuron-probe; then
   if sudo -u ubuntu env PATH="$SERVICE_PATH" NEURON_RT_NUM_CORES=2 \
-       /opt/gemma4/venv/bin/python /opt/gemma4/app/jax_neuron/probe.py; then
+       python3 /opt/gemma4/app/jax_neuron/probe.py; then
     phase_mark neuron-probe
   else
     echo "FATAL: the JAX Neuron stack does not work on this host. Fix it before" \
@@ -211,7 +239,7 @@ cat >/usr/local/bin/gemma4-jax-inf2-run <<'SCRIPT'
 set -euo pipefail
 export HF_TOKEN
 HF_TOKEN="$(cat /run/gemma4-hf-token)"
-exec /opt/gemma4/venv/bin/python \
+exec python3 \
   /opt/gemma4/app/deployments/aws-inf2/neuron_entrypoint.py \
   --model "$MODEL_ID" \
   --kv-cache-dtype int8 \
@@ -223,7 +251,7 @@ SCRIPT
 chmod 0755 /usr/local/bin/gemma4-jax-inf2-run
 
 cat >/etc/gemma4-inf2.env <<EOF
-# neuronx-cc is a console script in the venv, and libneuronxla shells out to it
+# neuronx-cc is a console script in /usr/local/bin, and libneuronxla shells out to it
 # by bare name to compile every graph. systemd hands the unit a default PATH of
 # /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin, which
 # does not include it, so the first compile dies inside XLA as
@@ -237,7 +265,22 @@ MODEL_ID=$MODEL_ID
 MAX_MODEL_LEN=$MAX_MODEL_LEN
 NEURON_CC_FLAGS=$NEURON_CC_FLAGS_VALUE
 HF_HOME=$CACHE_ROOT/huggingface
-JAX_COMPILATION_CACHE_DIR=$CACHE_ROOT/jax
+# JAX_COMPILATION_CACHE_DIR is deliberately NOT set. ports/gemma4/backend.py:134
+# declares persistent_compilation_cache=False for Neuron, and it is right: the
+# Neuron PJRT plugin cannot serialize a module for JAX's persistent cache. On
+# jax 0.6.2 setting it anyway was silently tolerated (3.9 MB of entries were
+# written and nobody noticed the contradiction). On jax 0.9.2 it is a hard
+# crash loop at startup, before the model ever loads:
+#   RET_CHECK failure (xla/hlo/ir/hlo_module.cc:822)
+#   proto.has_host_program_shape()  No program shape found in the proto
+# MEASURED 2026-08-02 on ami-09e1477ba5140fe3e / jax 0.9.2: unsetting this is
+# the whole fix; the service then starts clean and serves.
+#
+# Graph caching still happens, via NEURON_COMPILE_CACHE_URL below, which does
+# populate $CACHE_ROOT/neuron (model.hlo_module.pb + compile_flags.json per
+# MODULE_*). Do NOT add --cache_dir to NEURON_CC_FLAGS to "fix" that: neuronx-cc
+# 2.26 rejects it outright and every compile dies as
+#   [NCC_EARG002] Illegal argument(s) ... unrecognized: --cache_dir=...
 NEURON_COMPILE_CACHE_URL=$CACHE_ROOT/neuron
 EOF
 chmod 0600 /etc/gemma4-inf2.env

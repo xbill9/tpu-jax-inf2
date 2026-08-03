@@ -47,7 +47,8 @@ When managing TPU deployments or customizing vLLM serving, apply these vLLM para
 
 ## Coding Standards
 
-- **No virtualenvs:** use the system `python3`; if dependencies are missing, warn with the `pip install -r requirements.txt` command instead of creating a venv (this is also how `project-setup.sh` behaves).
+- **No virtualenvs, anywhere:** use the system `python3`; if dependencies are missing, warn with the `pip install -r requirements.txt` command instead of creating a venv (this is also how `project-setup.sh` behaves). This holds on provisioned hosts too, not just dev boxes — install into the dedicated interpreter directly, with `--break-system-packages` where PEP 668 applies (Ubuntu 24.04 and newer enforce it). The interpreter is the isolation; a venv is not.
+- **Latest versions, always:** take the newest published package, compiler, AMI, and OS image rather than a known-good older one. A version pin added to route around a defect is a workaround for a *pairing*, not a permanent fact — re-derive it whenever anything else moves, and prefer moving the whole stack forward to holding one component back. Measured here: `libneuronxla==2.2.*` in `deployments/aws-inf2/user_data.sh` existed solely because 3.0.3854.0 wanted an NRT 3.0 runtime that the SDK-2.29.1 AMI did not ship; on the SDK-2.31.0 AMI the resolver picks 3.0.3854.0 and it simply works, so the pin was pure carried cost. Upgrading also converted a silent misconfiguration into a loud one — `JAX_COMPILATION_CACHE_DIR` had contradicted `ports/gemma4/backend.py:134` for weeks without symptoms, and crashed immediately on JAX 0.9.2.
 - **Dependency portability:** do not assume third-party libraries like `pandas` are installed. Prefer the standard library (`csv`, `json`) for data parsing and aggregation scripts.
 
 ## Related Documentation
