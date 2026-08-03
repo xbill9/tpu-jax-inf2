@@ -1110,7 +1110,48 @@ def generate_n_tokens_scan(
     return all_generated
 
 
-def dequantize_params_to_dense(params: Dict[str, Any]) -> Dict[str, Any]:
+def qat_w4a16_unpack_dequant_numpy(packed_int4, scale, group_size: int = 32):
+    """Host-only twin of `qat_w4a16_unpack_dequant_jax`, in pure numpy.
+
+    Same arithmetic, same layout, no JAX. Exists so the dequant can be pinned to
+    the host on a single-backend platform: `JAX_PLATFORMS=neuron` leaves no CPU
+    backend, so `jax.default_device(jax.devices("cpu")[0])` raises
+    `Unknown backend cpu` and there is no in-JAX way to force host execution.
+
+    Returns float32 (not bf16): the caller casts once, and keeping full precision
+    here means the only bf16 rounding is the same final cast the device path does.
+    """
+    import numpy as _np
+
+    packed_int4 = _np.asarray(packed_int4)
+    scale = _np.asarray(scale, dtype=_np.float32)
+    if packed_int4.ndim != 2 or scale.ndim != 2:
+        raise ValueError(
+            f"W4A16 expects rank-2 packed/scale arrays, got "
+            f"{packed_int4.shape} and {scale.shape}"
+        )
+    if packed_int4.dtype != _np.int32:
+        raise TypeError(
+            f"W4A16 packed weights must be int32, got {packed_int4.dtype}"
+        )
+
+    out_features, packed_k = packed_int4.shape
+    in_features = packed_k * 8
+    expected_scale_shape = (out_features, in_features // group_size)
+    if in_features % group_size or scale.shape != expected_scale_shape:
+        raise ValueError(
+            f"W4A16 scale shape {scale.shape} does not match packed shape "
+            f"{packed_int4.shape}; expected {expected_scale_shape}"
+        )
+
+    shifts = (_np.arange(8, dtype=_np.int32) * 4)[None, None, :]
+    q = (packed_int4[:, :, None] >> shifts) & _np.int32(0xF)
+    q = q.reshape(out_features, in_features).astype(_np.float32) - 8.0
+    grouped = q.reshape(out_features, in_features // group_size, group_size)
+    return (grouped * scale[:, :, None]).reshape(out_features, in_features)
+
+
+def dequantize_params_to_dense(params: Dict[str, Any], on_host: bool = False) -> Dict[str, Any]:
     """Materialize every W4A16 weight to dense BF16 once, at load.
 
     W4A16 is a memory-for-compute trade: 4x smaller storage, paid for with a
@@ -1146,7 +1187,15 @@ def dequantize_params_to_dense(params: Dict[str, Any]) -> Dict[str, Any]:
             if scale is None:
                 raise ValueError(f"{name}_packed has no matching {name}_scale")
             # unpack -> [out, in]; the dense path contracts x[..., in] @ w[in, out]
-            out[name] = qat_w4a16_unpack_dequant_jax(node[f"{name}_packed"], scale).T
+            if on_host:
+                import numpy as _np
+                dense = qat_w4a16_unpack_dequant_numpy(
+                    _np.asarray(node[f"{name}_packed"]), _np.asarray(scale))
+                # .T here matches the jnp branch; the bf16 cast is the only
+                # rounding, same as the device path's output dtype.
+                out[name] = _np.ascontiguousarray(dense.T).astype(jnp.bfloat16)
+            else:
+                out[name] = qat_w4a16_unpack_dequant_jax(node[f"{name}_packed"], scale).T
         return out
 
     return convert(params)

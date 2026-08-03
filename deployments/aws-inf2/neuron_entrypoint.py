@@ -51,9 +51,22 @@ def configure_neuron() -> None:
     # never moves throughout, so the accelerator looks idle and healthy while
     # this happens.
     #
-    # The real fix is to find the miscomputing op -- jax_neuron/parity.py is the
-    # tool, and it must be run with this variable unset to reproduce the fault.
-    os.environ.setdefault("NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU", "1")
+    # RESOLVED 2026-08-03 -- do not re-enable this by default. The fault was
+    # localized to the IN-GRAPH W4A16 dequant: `--dequant-at-load` does the same
+    # arithmetic on the host and the output is correct on the NeuronCore with
+    # this variable OFF, at full speed. Evidence, in
+    # benchmarks/runs/2026-08-02-inf2-latest-stack-e2b/BISECT.md:
+    #   - the unpack primitive is bit-exact on device (bisect_w4a16.py, 4/4
+    #     integer stages, workaround off), so it is not the op's semantics;
+    #   - the same checkpoint on CPU produces coherent text, so it is not the
+    #     dequant math or the loader;
+    #   - host-side dequant on the NeuronCore produces coherent text at ~11 tok/s
+    #     against 5 tokens in 77-84 s for the workaround.
+    # Left at "0" explicitly rather than unset so the intent is legible, and so a
+    # stale value in /etc/gemma4-inf2.env cannot silently re-impose the 65x cost.
+    # The residual defect -- neuronx-cc's handling of the fused dequant-and-matmul
+    # at real shapes -- is still open; `--dequant-at-load` routes around it.
+    os.environ.setdefault("NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU", "0")
     os.environ.setdefault("NEURON_CC_FLAGS", "--model-type=transformer")
     # No JAX_E_PALLAS_INTERPRET override here any more. The engine reads
     # ports/gemma4/backend.py, sees that Neuron has no Pallas backend, and

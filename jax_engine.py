@@ -322,7 +322,15 @@ class JaxGemmaEngine:
                 self.params, bits=self.ple_bits,
                 group_size=self.config.hidden_size_per_layer_input)
         if self.dequant_at_load:
-            self.params = dequantize_params_to_dense(self.params)
+            # Dequantize on the HOST, in numpy. `dequantize_params_to_dense` is
+            # otherwise built from jnp ops, so it runs on jax.devices()[0] — i.e.
+            # eagerly on the accelerator — and the `device_put` below becomes a
+            # no-op. That distinction is the whole point of the flag on Neuron:
+            # it separates "the dequant arithmetic is wrong on device" from "the
+            # dequant is wrong once neuronx-cc fuses it into the decode graph".
+            # `jax.default_device(jax.devices("cpu")[0])` cannot express this —
+            # JAX_PLATFORMS=neuron leaves no CPU backend to select.
+            self.params = dequantize_params_to_dense(self.params, on_host=True)
             self.quant_mode = "fp16"      # weights are dense now
 
         set_w4a16_impl(self.w4a16_impl, self.w4a16_layout)

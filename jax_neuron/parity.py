@@ -255,6 +255,7 @@ def build_engine(
     kv_cache_dtype: str,
     quant_mode: str,
     window_kv: bool | None = None,
+    dequant_at_load: bool = False,
 ):
     """Load the engine the way `jax_openai_server.py` loads it."""
     from jax_engine import JaxGemmaEngine
@@ -265,6 +266,7 @@ def build_engine(
         quant_mode=quant_mode,
         max_model_len=max_model_len,
         window_kv=window_kv,
+        dequant_at_load=dequant_at_load,
     )
     engine.load(local_dir=local_dir)
     engine.bos_token_id = bos_token_id
@@ -380,6 +382,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--kv-cache-dtype", default="bf16")
     ap.add_argument("--quant-mode", default="fp16",
                     help="fp16 = dense path, correct for the -unquantized checkpoint.")
+    ap.add_argument("--dequant-at-load", action="store_true",
+                    help="Materialize packed weights to dense BF16 on the HOST at load, "
+                         "before device_put, and run the dense path. Splits an in-graph "
+                         "dequant defect from a dequant-math defect: the arithmetic is "
+                         "identical, only where it executes changes.")
     ap.add_argument("--subject-platform", default=None,
                     help="Sets JAX_PLATFORMS for the engine (e.g. cpu, neuron, tpu).")
     ap.add_argument("--reference", default=None,
@@ -484,8 +491,10 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.perf_counter()
     window_kv = {"auto": None, "on": True, "off": False}[args.window_kv]
     engine = build_engine(args.model_id, args.max_model_len, args.local_dir, bos,
-                          args.kv_cache_dtype, args.quant_mode, window_kv)
-    print(f"      window_kv={engine.window_kv} donate_cache={engine.donate_cache}")
+                          args.kv_cache_dtype, args.quant_mode, window_kv,
+                          args.dequant_at_load)
+    print(f"      window_kv={engine.window_kv} donate_cache={engine.donate_cache} "
+          f"dequant_at_load={args.dequant_at_load}")
     print(f"      loaded {engine.weight_bytes / 1e9:.2f} GB in {time.perf_counter() - t0:.1f}s")
 
     for res in report.results:

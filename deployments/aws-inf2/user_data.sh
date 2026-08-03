@@ -244,6 +244,7 @@ exec python3 \
   --model "$MODEL_ID" \
   --kv-cache-dtype int8 \
   --quant-mode w4a16 \
+  --dequant-at-load \
   --max-model-len "$MAX_MODEL_LEN" \
   --host 127.0.0.1 \
   --port 8000
@@ -282,6 +283,14 @@ HF_HOME=$CACHE_ROOT/huggingface
 # 2.26 rejects it outright and every compile dies as
 #   [NCC_EARG002] Illegal argument(s) ... unrecognized: --cache_dir=...
 NEURON_COMPILE_CACHE_URL=$CACHE_ROOT/neuron
+# RESOLVED 2026-08-03. This was "1" as a correctness workaround costing ~65x
+# (5 tokens in 77-84 s). The fault was localized to the IN-GRAPH W4A16 dequant,
+# and the service now passes --dequant-at-load, which does the same arithmetic on
+# the host and is correct on the NeuronCore with this OFF. Set explicitly rather
+# than left unset: the entrypoint only setdefault()s it, so an env file that
+# still said "1" would silently reimpose the cost.
+# See benchmarks/runs/2026-08-02-inf2-latest-stack-e2b/BISECT.md.
+NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU=0
 EOF
 chmod 0600 /etc/gemma4-inf2.env
 

@@ -126,6 +126,7 @@ def load_engine(
     quant_mode: str = "w4a16",
     max_model_len: int = 4096,
     local_dir: str | None = None,
+    dequant_at_load: bool = False,
 ):
     global ENGINE, TOKENIZER, MODEL_ID, KV_CACHE_DTYPE
     MODEL_ID, KV_CACHE_DTYPE = model_id, kv_dtype
@@ -145,6 +146,7 @@ def load_engine(
         kv_cache_dtype=kv_dtype,
         quant_mode=quant_mode,
         max_model_len=max_model_len,
+        dequant_at_load=dequant_at_load,
     )
     engine.load(local_dir=local_dir)
     engine.bos_token_id = getattr(TOKENIZER, "bos_token_id", None)
@@ -422,11 +424,19 @@ if __name__ == "__main__":
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--local-dir", default=None,
                         help="Load from a local checkpoint dir instead of the Hub")
+    parser.add_argument("--dequant-at-load", action="store_true",
+                        help="Materialize W4A16 weights to dense BF16 on the host at "
+                             "load. REQUIRED ON NEURON for correct W4A16 output: the "
+                             "in-graph dequant miscomputes there, while the identical "
+                             "arithmetic done on the host is correct and removes the "
+                             "need for NEURON_RUN_TRIVIAL_COMPUTATION_ON_CPU. Costs "
+                             "dense-weight memory (9.26 GB vs 6.56 GB on E2B).")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
     load_engine(
-        args.model, args.kv_cache_dtype, args.quant_mode, args.max_model_len, args.local_dir
+        args.model, args.kv_cache_dtype, args.quant_mode, args.max_model_len,
+        args.local_dir, args.dequant_at_load
     )
     uvicorn.run(app, host=args.host, port=args.port)

@@ -388,7 +388,12 @@ class UserDataShellTests(unittest.TestCase):
     def test_probe_and_service_share_one_path_definition(self):
         """Two PATH strings would drift, and the drift only shows at first compile."""
         text = self.rendered()
-        self.assertIn("SERVICE_PATH=/opt/gemma4/venv/bin:", text)
+        # No venv, per CLAUDE.md: packages install into the DLAMI's own
+        # interpreter, so neuronx-cc's console script lands in /usr/local/bin.
+        # This asserted a /opt/gemma4/venv/bin prefix until the venv was removed.
+        self.assertIn("SERVICE_PATH=/opt/aws/neuron/bin:", text)
+        self.assertIn("/usr/local/bin", text)
+        self.assertNotIn("/opt/gemma4/venv", text)
         self.assertIn("PATH=$SERVICE_PATH", text)
         self.assertIn('PATH="$SERVICE_PATH"', text)
 
