@@ -21,6 +21,12 @@ pydantic
 safetensors
 huggingface_hub
 
+# Host-side W4A16 dequant — ports/gemma4/jax_e_model.py imports numpy inside the
+# --dequant-at-load path. It arrives transitively via jax anyway, but that route
+# is not guaranteed by anything in this file, and the dequant is the workaround
+# the Inf2 deployment depends on for correct output.
+numpy
+
 # Tokenizer — jax_openai_server.py imports transformers.AutoTokenizer.
 # Also pulls in huggingface_hub, safetensors, and tokenizers; both are listed
 # above anyway so the requirement is explicit rather than transitive.
