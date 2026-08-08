@@ -127,6 +127,8 @@ def load_engine(
     max_model_len: int = 4096,
     local_dir: str | None = None,
     dequant_at_load: bool = False,
+    ple_bits: int = 0,
+    int8_lm_head: bool = False,
 ):
     global ENGINE, TOKENIZER, MODEL_ID, KV_CACHE_DTYPE
     MODEL_ID, KV_CACHE_DTYPE = model_id, kv_dtype
@@ -147,6 +149,8 @@ def load_engine(
         quant_mode=quant_mode,
         max_model_len=max_model_len,
         dequant_at_load=dequant_at_load,
+        ple_bits=ple_bits,
+        int8_lm_head=int8_lm_head,
     )
     engine.load(local_dir=local_dir)
     engine.bos_token_id = getattr(TOKENIZER, "bos_token_id", None)
@@ -166,13 +170,19 @@ def _eos_ids() -> list[int]:
             ids.append(val)
         elif isinstance(val, list):
             ids.extend(v for v in val if isinstance(v, int))
-    # Gemma chat turns terminate on <end_of_turn>
-    try:
-        turn_end = TOKENIZER.convert_tokens_to_ids("<end_of_turn>")
-        if isinstance(turn_end, int) and turn_end >= 0:
+    # Gemma chat turns terminate on the turn-end marker, but its spelling differs
+    # by checkpoint: <end_of_turn> on some, <turn|> on the QAT E2B ones. A name
+    # absent from the vocab does not raise -- convert_tokens_to_ids returns
+    # unk_token_id, which is >= 0 and so passed the old guard. That put <unk> in
+    # the stop set while leaving the REAL terminator out of it.
+    unk = getattr(TOKENIZER, "unk_token_id", None)
+    for name in ("<end_of_turn>", "<turn|>"):
+        try:
+            turn_end = TOKENIZER.convert_tokens_to_ids(name)
+        except Exception:
+            continue
+        if isinstance(turn_end, int) and turn_end >= 0 and turn_end != unk:
             ids.append(turn_end)
-    except Exception:
-        pass
     return sorted(set(ids))
 
 
@@ -433,10 +443,16 @@ if __name__ == "__main__":
                              "dense-weight memory (9.26 GB vs 6.56 GB on E2B).")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--ple-bits", type=int, default=0, choices=[0, 4, 8],
+        help="Quantize the per-layer-embedding table. 0 = off.")
+    parser.add_argument(
+        "--int8-lm-head", action="store_true",
+        help="Quantize the LM head to int8. NOT numerics-preserving.")
     args = parser.parse_args()
 
     load_engine(
         args.model, args.kv_cache_dtype, args.quant_mode, args.max_model_len,
-        args.local_dir, args.dequant_at_load
+        args.local_dir, args.dequant_at_load, args.ple_bits, args.int8_lm_head,
     )
     uvicorn.run(app, host=args.host, port=args.port)
